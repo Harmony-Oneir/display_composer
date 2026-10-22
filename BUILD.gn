@@ -12,6 +12,8 @@ _subsystem = "oneir"
 
 _composer_include_dirs = [
   "src/display_device",
+  "//oneir/display_buffer/include",
+  "//oneir/display_buffer/src/display_gralloc",
   "//drivers/peripheral/base",
   "//drivers/peripheral/display/utils/include",
   "//drivers/peripheral/display/buffer/hdi_service/include",
