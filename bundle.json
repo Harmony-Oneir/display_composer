@@ -1,0 +1,43 @@
+{
+  "name": "@oneir/display_composer",
+  "description": "Display Composer VDI (DRM/KMS) for OpenHarmony on x86_64 PC",
+  "version": "1.0.0",
+  "license": "Apache License 2.0",
+  "publishAs": "code-segment",
+  "segment": {
+    "destPath": "oneir/display_composer"
+  },
+  "dirs": {},
+  "scripts": {},
+  "component": {
+    "name": "oneir_display_composer",
+    "subsystem": "oneir",
+    "syscap": [],
+    "features": [],
+    "adapted_system_type": [ "standard" ],
+    "rom": "",
+    "ram": "",
+    "deps": {
+      "components": [
+        "c_utils",
+        "drivers_interface_display",
+        "graphic_surface",
+        "hdf_core",
+        "hilog",
+        "hitrace",
+        "ipc",
+        "oneir_display"
+      ],
+      "third_party": [
+        "libdrm"
+      ]
+    },
+    "build": {
+      "sub_component": [
+        "//oneir/display_composer:display_composer"
+      ],
+      "inner_kits": [],
+      "test": []
+    }
+  }
+}
