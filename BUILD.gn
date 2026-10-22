@@ -1,0 +1,115 @@
+# oneir: Display Composer VDI (композитор для Display HDI).
+# За основу взята реализация QEMU virt_full (DRM/KMS, атомарный коммит).
+# Отличия: DRM-устройство и подсветка выбираются через oneir_drm_select
+# (тот же GPU, что у аллокатора), буферная VDI берётся из компонента oneir_display.
+#
+# Сборка из корня дерева:  ./oneir/make.sh //oneir/display_composer:display_composer
+
+import("//build/ohos.gni")
+
+_part = "oneir_display_composer"
+_subsystem = "oneir"
+
+_composer_include_dirs = [
+  "src/display_device",
+  "//drivers/peripheral/base",
+  "//drivers/peripheral/display/utils/include",
+  "//drivers/peripheral/display/buffer/hdi_service/include",
+  "//drivers/peripheral/display/composer/hdi_service/include",
+  "//drivers/interface/display/composer",
+  "//drivers/interface/display/composer/hdifd_parcelable",
+  "//foundation/communication/ipc/interfaces/innerkits/ipc_core/include",
+]
+
+# DRM-логика: устройство, коннекторы, CRTC, plane'ы, слои, коммит, VSync, hotplug.
+ohos_shared_library("oneir_display_composer_vendor") {
+  sources = [
+    "src/display_device/drm_connector.cpp",
+    "src/display_device/drm_crtc.cpp",
+    "src/display_device/drm_device.cpp",
+    "src/display_device/drm_display.cpp",
+    "src/display_device/drm_encoder.cpp",
+    "src/display_device/drm_plane.cpp",
+    "src/display_device/drm_vsync_worker.cpp",
+    "src/display_device/hdi_composer.cpp",
+    "src/display_device/hdi_device_interface.cpp",
+    "src/display_device/hdi_display.cpp",
+    "src/display_device/hdi_drm_composition.cpp",
+    "src/display_device/hdi_drm_layer.cpp",
+    "src/display_device/hdi_gfx_composition.cpp",
+    "src/display_device/hdi_layer.cpp",
+    "src/display_device/hdi_netlink_monitor.cpp",
+    "src/display_device/hdi_session.cpp",
+  ]
+  output_name = "display_composer_vendor"
+  include_dirs = _composer_include_dirs
+  cflags_cc = [
+    "-Wno-error=unused-function",
+    "-Wno-error=missing-braces",
+    "-Wno-error=#warnings",
+  ]
+  deps = [ "//third_party/libdrm:libdrm" ]
+  external_deps = [
+    "c_utils:utils",
+    "drivers_interface_display:display_buffer_idl_headers",
+    "drivers_interface_display:display_composer_idl_headers",
+    "graphic_surface:buffer_handle",
+    "hdf_core:libhdf_utils",
+    "hilog:libhilog",
+    "hitrace:hitrace_meter",
+    "oneir_display:oneir_display_buffer_vdi_impl",
+    "oneir_display:oneir_drm_select",
+  ]
+  install_enable = true
+  install_images = [ chipset_base_dir ]
+  part_name = _part
+  subsystem_name = _subsystem
+}
+
+# Библиотека, которую загружает HDI-сервис композитора через dlopen.
+ohos_shared_library("oneir_display_composer_vdi_impl") {
+  sources = [ "src/display_device/display_composer_vdi_impl.cpp" ]
+  output_name = "libdisplay_composer_vdi_impl"
+  include_dirs = _composer_include_dirs
+  deps = [ ":oneir_display_composer_vendor" ]
+  external_deps = [
+    "c_utils:utils",
+    "drivers_interface_display:display_composer_idl_headers",
+    "graphic_surface:buffer_handle",
+    "hilog:libhilog",
+    "ipc:ipc_single",
+  ]
+  install_enable = true
+  install_images = [ chipset_base_dir ]
+  part_name = _part
+  subsystem_name = _subsystem
+}
+
+# Программная 2D-композиция (загружается через dlopen("libdisplay_gfx.z.so")).
+ohos_shared_library("oneir_display_gfx") {
+  sources = [ "src/display_gfx/display_gfx.c" ]
+  output_name = "display_gfx"
+  include_dirs = [
+    "//drivers/peripheral/display/interfaces/include",
+    "//drivers/peripheral/display/utils/include",
+    "//drivers/peripheral/base",
+  ]
+  cflags = [ "-Wno-macro-redefined" ]
+  external_deps = [
+    "c_utils:utils",
+    "hdf_core:libhdf_utils",
+    "hilog:libhilog",
+  ]
+  install_enable = true
+  install_images = [ chipset_base_dir ]
+  part_name = _part
+  subsystem_name = _subsystem
+}
+
+group("display_composer") {
+  deps = [
+    ":oneir_display_composer_vdi_impl",
+    ":oneir_display_composer_vendor",
+    ":oneir_display_gfx",
+  ]
+}
