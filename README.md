@@ -40,3 +40,11 @@ sudo ls -l /proc/$P/fd | grep dri
 /vendor/lib64/libdisplay_composer_vendor.z.so
 ```
 Хост загрузил драйвер и службу Composer (`libdisplay_composer_driver_1.0`, `libdisplay_composer_service_1.5`), VDI (`libdisplay_composer_vdi_impl` + `libdisplay_composer_vendor`), буферный VDI (`libdisplay_buffer_vdi_impl` + `libdisplay_buffer_vendor`) и `libdrm`.
+
+Для тестирования нужны следующие цели:
+|Цель| Что проверяет |
+|----|---------------|
+|`unittest:composer_ut`|Интерфейс композитора: возможности экрана, режимы, питание, подсветка, VSync, создание слоёв и их свойства, prepare и commit|
+| `moduletest:composer_mt` | Сценарии целиком: создаёт слои с тестовыми изображениями и выводит их на экран. Главная проверка цепочки до экрана |
+| `benchmark:hdf_display_benchmark_test` | Скорость операций композитора |
+| `unittest:composer_death_test` | Поведение при падении клиента |
