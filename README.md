@@ -48,3 +48,7 @@ sudo ls -l /proc/$P/fd | grep dri
 | `moduletest:composer_mt` | Сценарии целиком: создаёт слои с тестовыми изображениями и выводит их на экран. Главная проверка цепочки до экрана |
 | `benchmark:hdf_display_benchmark_test` | Скорость операций композитора |
 | `unittest:composer_death_test` | Поведение при падении клиента |
+
+Результаты сборки:
+out/oneir/tests/moduletest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_mt
+out/oneir/tests/unittest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_ut
