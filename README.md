@@ -50,5 +50,7 @@ sudo ls -l /proc/$P/fd | grep dri
 | `unittest:composer_death_test` | Поведение при падении клиента |
 
 Результаты сборки:
-out/oneir/tests/moduletest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_mt
-out/oneir/tests/unittest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_ut
+* `out/oneir/tests/moduletest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_mt`
+* `out/oneir/tests/unittest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_ut`
+* `out/oneir/tests/benchmark/drivers_peripheral_display/drivers_peripheral_display_composer/hdf_display_benchmark_test`
+* `out/oneir/tests/unittest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_death_test`
