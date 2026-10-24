@@ -17,7 +17,14 @@
 #include "drm_connector.h"
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <algorithm>
+#include <cerrno>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <string>
+#include <unistd.h>
 #include <securec.h>
 #include "display_log.h"
 #include "drm_device.h"
@@ -26,6 +33,39 @@
 namespace OHOS {
 namespace HDI {
 namespace DISPLAY {
+namespace {
+/* oneir: уровень яркости в интерфейсе композитора — 0..255; подсветка панели
+ * (sysfs backlight) имеет свою шкалу 0..max_brightness (у intel_backlight — тысячи). */
+constexpr uint32_t OHOS_BRIGHTNESS_MAX = 255;
+
+/* Путь к файлу рядом с brightness (OneirBacklightPath() указывает на .../brightness). */
+std::string BacklightSibling(const char *name)
+{
+    std::string path = OneirBacklightPath();
+    auto pos = path.rfind('/');
+    return (pos == std::string::npos ? std::string() : path.substr(0, pos + 1)) + name;
+}
+
+int32_t ReadSysfsInt(const std::string &path)
+{
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    char buf[16] = {0};
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    return n > 0 ? atoi(buf) : -1;
+}
+
+/* max_brightness читается один раз; -1 — шкала неизвестна (пишем уровень как есть). */
+int32_t BacklightMax()
+{
+    static int32_t maxValue = ReadSysfsInt(BacklightSibling("max_brightness"));
+    return maxValue;
+}
+} // namespace
+
 void DrmMode::ConvertToHdiMode(DisplayModeInfo &hdiMode)
 {
     hdiMode.height = mModeInfo.vdisplay;
@@ -99,61 +139,53 @@ int32_t DrmConnector::Init(DrmDevice &drmDevice)
 
 int32_t DrmConnector::GetBrightness(uint32_t &level)
 {
-    if (mPropBrightnessId == DRM_INVALID_ID) {
-        DISPLAY_LOGE("the prop id of brightness is invalid");
-        //return DISPLAY_NOT_SUPPORT;
+    if (!mBrightnessSet) {
+        /* До первой установки — текущая яркость панели, пересчитанная в 0..255. */
+        int32_t maxValue = BacklightMax();
+        int32_t cur = ReadSysfsInt(OneirBacklightPath());
+        if (maxValue > 0 && cur >= 0) {
+            mBrightnessLevel = static_cast<uint32_t>(
+                (static_cast<int64_t>(cur) * OHOS_BRIGHTNESS_MAX + maxValue / 2) / maxValue);
+        }
     }
     level = mBrightnessLevel;
- 
     return DISPLAY_SUCCESS;
 }
 
 int32_t DrmConnector::SetBrightness(uint32_t level)
 {
-    DISPLAY_LOGD("DrmConnector::SetBrightness set %{public}d", level);
-    static int32_t blFd = 0;
-    int32_t ret = 0;
-    int bytes = 0;
-    char buffer[10];
-    int32_t light_level;
-
-    if (blFd <= 0) {
-        blFd = open(OneirBacklightPath(), O_RDWR);
+    static int32_t blFd = -1;
+    if (blFd < 0) {
+        blFd = open(OneirBacklightPath(), O_WRONLY | O_CLOEXEC);
         if (blFd < 0) {
-            DISPLAY_LOGE("DrmConnector::SetBrightness open file error %{public}s", strerror(errno));
+            DISPLAY_LOGE("SetBrightness: open %{public}s failed: %{public}s", OneirBacklightPath(), strerror(errno));
             return DISPLAY_FAILURE;
         }
     }
-    if (level < 0) {
-        DISPLAY_LOGE("DrmConnector::SetBrightness write error");
-        return DISPLAY_FAILURE;
+
+    uint32_t clamped = std::min(level, OHOS_BRIGHTNESS_MAX);
+    int32_t maxValue = BacklightMax();
+    int64_t hw = clamped;                       /* шкала панели неизвестна — пишем как есть */
+    if (maxValue > 0) {
+        hw = (static_cast<int64_t>(clamped) * maxValue + OHOS_BRIGHTNESS_MAX / 2) / OHOS_BRIGHTNESS_MAX;
+        if (clamped > 0 && hw == 0) {
+            hw = 1;                             /* ненулевой уровень не должен гасить подсветку */
+        }
     }
-    ret = memset_s(buffer, sizeof(buffer), 0, sizeof(buffer));
-    if (ret < 0) {
-        DISPLAY_LOGE("DrmConnector::SetBrightness memset_s error");
-        return DISPLAY_FAILURE;
-    }
-    light_level = ceil((level / 28));
-    if (light_level > 7) {
-        light_level = 7;
-    }
-    else if (light_level < 1) {
-         light_level = 1;
-    }
-    bytes = sprintf_s(buffer, sizeof(buffer), "%d", light_level);
-    if (bytes < 0) {
-        DISPLAY_LOGE("DrmConnector::SetBrightness sprintf_s error");
-        return DISPLAY_FAILURE;
-    }
-    ret = write(blFd, buffer, bytes);
-    if (ret < 0) {
-        DISPLAY_LOGE("DrmConnector::SetBrightness write error");
+
+    char buffer[24] = {0};
+    int bytes = sprintf_s(buffer, sizeof(buffer), "%lld", static_cast<long long>(hw));
+    /* pwrite с нулевым смещением: файл открыт один раз, атрибут sysfs пишется целиком. */
+    if (bytes < 0 || pwrite(blFd, buffer, bytes, 0) < 0) {
+        DISPLAY_LOGE("SetBrightness: write %{public}s failed: %{public}s", buffer, strerror(errno));
         return DISPLAY_FAILURE;
     }
 
+    /* Возвращаем ровно установленный уровень: «установил X — прочитал X». */
     mBrightnessLevel = level;
-    DISPLAY_LOGD("DrmConnector::SetBrightness exit !!!!");
-
+    mBrightnessSet = true;
+    DISPLAY_LOGD("SetBrightness: level %{public}u -> %{public}lld of %{public}d", level,
+        static_cast<long long>(hw), maxValue);
     return DISPLAY_SUCCESS;
 }
 
@@ -204,6 +236,9 @@ void DrmConnector::ConvertToHdiType(uint32_t type, InterfaceType &hdiType)
         case DRM_MODE_CONNECTOR_HDMIB:
             hdiType = DISP_INTF_HDMI;
             break;
+        /* oneir: встроенные панели ноутбуков (eDP, LVDS) — тоже «панель». */
+        case DRM_MODE_CONNECTOR_eDP:
+        case DRM_MODE_CONNECTOR_LVDS:
         case DRM_MODE_CONNECTOR_VIRTUAL:
             hdiType = DISP_INTF_PANEL;
             break;
