@@ -122,6 +122,17 @@ int32_t HdiDisplay::DestroyLayer(uint32_t layerId)
     return DISPLAY_SUCCESS;
 }
 
+void HdiDisplay::DestroyAllLayers()
+{
+    // oneir: DestroyAllLayers. Служба композитора не отслеживает смерть клиента, и слои отключившегося RS
+    // оставались навсегда (по одному с каждым перезапуском RS). Порядок важен: сначала наборы
+    // с сырыми указателями, затем владелец — деструкторы слоёв освобождают буферы и FB.
+    DISPLAY_LOGI("destroy %{public}zu stale layers", mLayersMap.size());
+    mChangeLayers.clear();
+    mLayers.clear();
+    mLayersMap.clear();
+}
+
 int32_t HdiDisplay::GetDisplayCompChange(uint32_t *num, uint32_t *layers, int32_t *type)
 {
     DISPLAY_CHK_RETURN((num == nullptr), DISPLAY_FAILURE, DISPLAY_LOGE("the num is nullptr"));
