@@ -14,6 +14,10 @@
  */
 
 #include "drm_vsync_worker.h"
+#include <unistd.h>
+#include <ctime>
+#include <cerrno>
+#include <xf86drm.h>
 #include <chrono>
 #include "display_log.h"
 #include "drm_device.h"
@@ -72,12 +76,37 @@ bool DrmVsyncWorker::WaitSignalAndCheckRuning()
 
 uint64_t DrmVsyncWorker::WaitNextVBlank(unsigned int &sq)
 {
+    // oneir: настоящий VBlank ядра вместо таймера QEMU-реализации (usleep(16666) давал период
+    // ~17,5 мс при развёртке панели 16,65 мс, и генератор VSync в RS отставал от экрана — рывки).
+    // Время из ответа ядра — момент VBlank по CLOCK_MONOTONIC (те же часы, что у RS), в нс.
+    // Pipe 0 (pipe A) — встроенная панель стенда; для других pipe нужны DRM_VBLANK_SECONDARY
+    // (pipe 1) или pipe << DRM_VBLANK_HIGH_CRTC_SHIFT.
+    static constexpr uint32_t VBLANK_PIPE = 0;
+    drmVBlank vbl = {};
+    uint32_t type = DRM_VBLANK_RELATIVE;
+    if (VBLANK_PIPE == 1) {
+        type |= DRM_VBLANK_SECONDARY;
+    } else if (VBLANK_PIPE > 1) {
+        type |= (VBLANK_PIPE << DRM_VBLANK_HIGH_CRTC_SHIFT) & DRM_VBLANK_HIGH_CRTC_MASK;
+    }
+    vbl.request.type = static_cast<drmVBlankSeqType>(type);
+    vbl.request.sequence = 1; // ближайший VBlank
+    if (drmWaitVBlank(mDrmFd, &vbl) == 0) {
+        sq = vbl.reply.sequence;
+        return static_cast<uint64_t>(vbl.reply.tval_sec) * 1000000000ULL +
+               static_cast<uint64_t>(vbl.reply.tval_usec) * 1000ULL;
+    }
+
+    // Запасной путь (CRTC выключен и т.п.): программный период, но с правильным временем в нс.
+    static uint32_t failures = 0;
+    if ((failures++ % 600) == 0) { // не чаще раза в ~10 с
+        DISPLAY_LOGW("drmWaitVBlank failed, errno %{public}d; software vsync", errno);
+    }
+    usleep(16666);
     struct timespec curTime = {0, 0};
     clock_gettime(CLOCK_MONOTONIC, &curTime);
-    usleep(16666);
-    // 1000000000 is used for transfer second to nsec
-    uint64_t duration = static_cast<uint64_t>(curTime.tv_sec) * 1000000 + static_cast<uint64_t>(curTime.tv_nsec);
-    return (uint64_t)(duration);
+    sq++;
+    return static_cast<uint64_t>(curTime.tv_sec) * 1000000000ULL + static_cast<uint64_t>(curTime.tv_nsec);
 }
 
 
