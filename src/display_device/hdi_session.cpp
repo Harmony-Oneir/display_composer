@@ -73,6 +73,14 @@ void HdiSession::HandleHotplug(bool plugIn)
 
 int32_t HdiSession::RegHotPlugCallback(HotPlugCallback callback, void *data)
 {
+    // oneir: DestroyAllLayers: регистрация обратного вызова — признак подключения нового клиента (RS делает
+    // это в начале работы, до создания своих слоёв). На стенде клиент один, поэтому все слои,
+    // оставшиеся к этому моменту, принадлежат прежним клиентам.
+    for (auto &entry : mHdiDisplays) {
+        if (entry.second) {
+            entry.second->DestroyAllLayers();
+        }
+    }
     DISPLAY_CHK_RETURN((callback == nullptr), DISPLAY_NULL_PTR, DISPLAY_LOGE("the callback is nullptr"));
     mHotPlugCallBacks.emplace(callback, data);
     DISPLAY_LOGI("HdiSession RegHotPlugCallback callbacks=%{public}zu displays=%{public}zu",
