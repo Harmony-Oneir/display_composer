@@ -89,6 +89,8 @@ public:
     }
     virtual int32_t CreateLayer(const LayerInfo *layerInfo, uint32_t *layerId);
     virtual int32_t DestroyLayer(uint32_t layerId);
+    // oneir: DestroyAllLayers: удалить все слои дисплея (кроме клиентского) — при подключении нового клиента
+    void DestroyAllLayers();
     virtual int32_t PrepareDisplayLayers(bool *needFlushFb);
     virtual int32_t Commit(int32_t *fence);
     virtual int32_t GetDisplayCompChange(uint32_t *num, uint32_t *layers, int32_t *type);
