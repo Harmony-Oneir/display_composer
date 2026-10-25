@@ -15,7 +15,70 @@
 
 #include "hdi_drm_composition.h"
 #include <cerrno>
+#include <poll.h>
+#include "param/sys_param.h"
+#include <map>
+#include <string>
+#include <mutex>
+#include <unistd.h>
 #include "hdi_drm_layer.h"
+
+namespace {
+// oneir: не более одного незавершённого неблокирующего коммита на CRTC.
+// Иначе ядро отвергает новый коммит с EBUSY, композитор не обновляет release fence,
+// и RS начинает рисовать в буфер, который ещё на экране (мерцание движущихся объектов).
+std::mutex g_prevCommitMutex;
+std::map<uint32_t, int> g_prevCommitFence; // CRTC -> OUT_FENCE последнего коммита
+
+void WaitPrevCommit(uint32_t crtcId, int timeoutMs)
+{
+    int fd = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_prevCommitMutex);
+        auto it = g_prevCommitFence.find(crtcId);
+        if (it != g_prevCommitFence.end()) {
+            fd = it->second;
+        }
+    }
+    if (fd >= 0) {
+        struct pollfd pfd = {fd, POLLIN, 0};
+        poll(&pfd, 1, timeoutMs);
+    }
+}
+
+void StorePrevCommit(uint32_t crtcId, int outFence)
+{
+    if (outFence < 0) {
+        return;
+    }
+    int copy = dup(outFence);
+    std::lock_guard<std::mutex> lock(g_prevCommitMutex);
+    auto it = g_prevCommitFence.find(crtcId);
+    if (it != g_prevCommitFence.end()) {
+        if (it->second >= 0) {
+            close(it->second);
+        }
+        it->second = copy;
+    } else {
+        g_prevCommitFence.emplace(crtcId, copy);
+    }
+}
+
+// oneir: режимы композитора через системные параметры (кэшированные: дёшево читать на каждом
+// коммите, изменение через `param set` подхватывается без перезапуска).
+bool ParamEnabled(const char *name)
+{
+    static std::mutex m;
+    static std::map<std::string, CachedHandle> handles;
+    std::lock_guard<std::mutex> lock(m);
+    auto it = handles.find(name);
+    if (it == handles.end()) {
+        it = handles.emplace(name, CachedParameterCreate(name, "0")).first;
+    }
+    const char *v = it->second ? CachedParameterGet(it->second) : nullptr;
+    return v != nullptr && v[0] == '1';
+}
+} // namespace
 
 namespace OHOS {
 namespace HDI {
@@ -292,11 +355,33 @@ int32_t HdiDrmComposition::Apply(bool modeSet)
     DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE,
         DISPLAY_LOGE("can not add the active prop errno %{public}d", errno));
 
-    uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
+    // oneir: отладочные переключатели для поиска причины мерцания (системные параметры, без перезапуска).
+    //   oneir.composer.cpuwait=1          — перед коммитом ждать acquire fence слоёв на CPU (до 100 мс)
+    //   persist.oneir.composer.nonblock=1 — неблокирующий атомарный коммит (по умолчанию блокирующий)
+    if (ParamEnabled("oneir.composer.cpuwait")) {
+        for (auto layer : mCompLayers) {
+            int fd = layer->GetAcquireFenceFd();
+            if (fd >= 0) {
+                struct pollfd pfd = {fd, POLLIN, 0};
+                int pr = poll(&pfd, 1, 100);
+                DISPLAY_LOGD("cpuwait: layer %{public}d fence %{public}d poll %{public}d", layer->GetId(), fd, pr);
+            }
+        }
+    }
+    // oneir: по умолчанию блокирующий коммит — кадр выведен к моменту возврата, коммиты не
+    // накладываются (неблокирующий режим давал EBUSY и мерцание движущихся объектов).
+    uint32_t flags = ParamEnabled("persist.oneir.composer.nonblock") ? DRM_MODE_ATOMIC_NONBLOCK : 0;
 
+    WaitPrevCommit(mCrtc->GetId(), 50);
     ret = drmModeAtomicCommit(drmFd, atomicReqPtr.Get(), flags, nullptr);
+    if (ret != 0 && errno == EBUSY) {
+        DISPLAY_LOGW("drmModeAtomicCommit busy, wait for the previous commit and retry");
+        WaitPrevCommit(mCrtc->GetId(), 100);
+        ret = drmModeAtomicCommit(drmFd, atomicReqPtr.Get(), flags, nullptr);
+    }
     DISPLAY_CHK_RETURN((ret != 0), DISPLAY_FAILURE,
         DISPLAY_LOGE("drmModeAtomicCommit failed %{public}d errno %{public}d", ret, errno));
+    StorePrevCommit(mCrtc->GetId(), static_cast<int>(crtcOutFence));
     // set the release fence
     for (auto layer : mCompLayers) {
         layer->SetReleaseFence(static_cast<int>(crtcOutFence));
