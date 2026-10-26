@@ -13,499 +13,251 @@
  * limitations under the License.
  */
 
-#include "hdi_drm_composition.h"
-#include <cerrno>
-#include <poll.h>
-#include <chrono>
-#include <condition_variable>
-#include <cstdint>
-#include <thread>
-#include <xf86drm.h>
-#include "param/sys_param.h"
-#include <map>
+#include "drm_display.h"
 #include <string>
-#include <mutex>
-#include <unistd.h>
-#include "hdi_drm_layer.h"
-
-namespace {
-// oneir: не более одного незавершённого неблокирующего коммита на CRTC.
-// Иначе ядро отвергает новый коммит с EBUSY, композитор не обновляет release fence,
-// и RS начинает рисовать в буфер, который ещё на экране (мерцание движущихся объектов).
-std::mutex g_prevCommitMutex;
-std::map<uint32_t, int> g_prevCommitFence; // CRTC -> OUT_FENCE последнего коммита
-
-void WaitPrevCommit(uint32_t crtcId, int timeoutMs)
-{
-    int fd = -1;
-    {
-        std::lock_guard<std::mutex> lock(g_prevCommitMutex);
-        auto it = g_prevCommitFence.find(crtcId);
-        if (it != g_prevCommitFence.end()) {
-            fd = it->second;
-        }
-    }
-    if (fd >= 0) {
-        struct pollfd pfd = {fd, POLLIN, 0};
-        poll(&pfd, 1, timeoutMs);
-    }
-}
-
-void StorePrevCommit(uint32_t crtcId, int outFence)
-{
-    if (outFence < 0) {
-        return;
-    }
-    int copy = dup(outFence);
-    std::lock_guard<std::mutex> lock(g_prevCommitMutex);
-    auto it = g_prevCommitFence.find(crtcId);
-    if (it != g_prevCommitFence.end()) {
-        if (it->second >= 0) {
-            close(it->second);
-        }
-        it->second = copy;
-    } else {
-        g_prevCommitFence.emplace(crtcId, copy);
-    }
-}
-
-// oneir: режимы композитора через системные параметры (кэшированные: дёшево читать на каждом
-// коммите, изменение через `param set` подхватывается без перезапуска).
-bool ParamEnabled(const char *name)
-{
-    static std::mutex m;
-    static std::map<std::string, CachedHandle> handles;
-    std::lock_guard<std::mutex> lock(m);
-    auto it = handles.find(name);
-    if (it == handles.end()) {
-        it = handles.emplace(name, CachedParameterCreate(name, "0")).first;
-    }
-    const char *v = it->second ? CachedParameterGet(it->second) : nullptr;
-    return v != nullptr && v[0] == '1';
-}
-
-// oneir: flip events: отслеживание завершения смены кадра по событиям DRM.
-// Ядро отвергает неблокирующий коммит (EBUSY), пока у предыдущего не завершён flip_done; событие
-// DRM_MODE_PAGE_FLIP_EVENT приходит ровно в этот момент. Поток событий читает их из fd DRM и
-// снимает отметку «смена кадра в процессе» для CRTC.
-class FlipTracker {
-public:
-    void EnsureStarted(int fd)
-    {
-        std::call_once(once_, [this, fd]() {
-            fd_ = fd;
-            std::thread([this]() { Loop(); }).detach();
-        });
-    }
-
-    void MarkPending(uint32_t crtcId)
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        pending_[crtcId] = true;
-    }
-
-    void ClearPending(uint32_t crtcId)
-    {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            pending_[crtcId] = false;
-        }
-        cv_.notify_all();
-    }
-
-    // true — смена кадра завершена (или её не было); false — таймаут
-    bool WaitIdle(uint32_t crtcId, int timeoutMs)
-    {
-        std::unique_lock<std::mutex> lock(mu_);
-        return cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this, crtcId]() {
-            auto it = pending_.find(crtcId);
-            return it == pending_.end() || !it->second;
-        });
-    }
-
-private:
-    static void OnFlip(int, unsigned int, unsigned int, unsigned int, unsigned int crtcId, void *userData)
-    {
-        // номер CRTC приходит в событии, если ядро поддерживает DRM_CAP_CRTC_IN_VBLANK_EVENT
-        // (Linux >= 4.12); иначе 0 — тогда берём его из user_data, переданного в коммит
-        if (crtcId == 0) {
-            crtcId = static_cast<unsigned int>(reinterpret_cast<uintptr_t>(userData));
-        }
-        Instance().ClearPending(crtcId);
-    }
-
-    void Loop()
-    {
-        drmEventContext ev = {};
-        ev.version = 3; // page_flip_handler2 (с номером CRTC)
-        ev.page_flip_handler2 = &FlipTracker::OnFlip;
-        while (true) {
-            struct pollfd pfd = {fd_, POLLIN, 0};
-            int r = poll(&pfd, 1, 1000);
-            if (r > 0 && (pfd.revents & POLLIN)) {
-                drmHandleEvent(fd_, &ev);
-            }
-        }
-    }
-
-public:
-    static FlipTracker &Instance()
-    {
-        static FlipTracker tracker;
-        return tracker;
-    }
-
-private:
-    std::once_flag once_;
-    int fd_ = -1;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    std::map<uint32_t, bool> pending_;
-};
-
-constexpr int FLIP_WAIT_MS = 100;
-constexpr int EBUSY_RETRIES = 3;
-} // namespace
+#include <cerrno>
+#include <memory>
+#include <sys/ioctl.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include "display_buffer_vdi_impl.h"
+#include "display_log.h"
+#include "drm_device.h"
+#include "drm_vsync_worker.h"
+#include "hdi_drm_composition.h"
+#include "hdi_gfx_composition.h"
+#include "idisplay_buffer_vdi.h"
 
 namespace OHOS {
 namespace HDI {
 namespace DISPLAY {
-HdiDrmComposition::HdiDrmComposition(const std::shared_ptr<DrmConnector> &connector,
-                                     const std::shared_ptr<DrmCrtc> &crtc,
-                                     const std::shared_ptr<DrmDevice> &drmDevice)
+using namespace OHOS::HDI::Display::Buffer::V1_0;
+DrmDisplay::DrmDisplay(std::shared_ptr<DrmConnector> connector, std::shared_ptr<DrmCrtc> crtc,
+    std::shared_ptr<DrmDevice> drmDevice)
     : mDrmDevice(drmDevice), mConnector(connector), mCrtc(crtc)
+{}
+
+DrmDisplay::~DrmDisplay()
 {
-    DISPLAY_LOGD();
+    if (mCrtc != nullptr) {
+        mCrtc->UnBindDisplay(GetId());
+    }
 }
 
-int32_t HdiDrmComposition::Init()
+int32_t DrmDisplay::Init()
 {
-    DISPLAY_LOGD();
-    mPrimPlanes.clear();
-    mOverlayPlanes.clear();
-    mPlanes.clear();
+    int ret;
     DISPLAY_CHK_RETURN((mCrtc == nullptr), DISPLAY_FAILURE, DISPLAY_LOGE("crtc is null"));
     DISPLAY_CHK_RETURN((mConnector == nullptr), DISPLAY_FAILURE, DISPLAY_LOGE("connector is null"));
     DISPLAY_CHK_RETURN((mDrmDevice == nullptr), DISPLAY_FAILURE, DISPLAY_LOGE("drmDevice is null"));
-    mPrimPlanes = mDrmDevice->GetDrmPlane(mCrtc->GetPipe(), DRM_PLANE_TYPE_PRIMARY);
-    mOverlayPlanes = mDrmDevice->GetDrmPlane(mCrtc->GetPipe(), DRM_PLANE_TYPE_OVERLAY);
-    mPlanes.insert(mPlanes.end(), mPrimPlanes.begin(), mPrimPlanes.end());
-    mPlanes.insert(mPlanes.end(), mOverlayPlanes.begin(), mOverlayPlanes.end());
+
+    ret = HdiDisplay::Init();
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("init failed"));
+    auto preComp = std::make_unique<HdiGfxComposition>();
+    DISPLAY_CHK_RETURN((preComp == nullptr), DISPLAY_FAILURE,
+        DISPLAY_LOGE("can not new HdiGfxComposition errno %{public}d", errno));
+    ret = preComp->Init();
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("can not init HdiGfxComposition"));
+
+    auto postComp = std::make_unique<HdiDrmComposition>(mConnector, mCrtc, mDrmDevice);
+    DISPLAY_CHK_RETURN((postComp == nullptr), DISPLAY_FAILURE,
+        DISPLAY_LOGE("can not new HdiDrmComposition errno %{public}d", errno));
+    ret = postComp->Init();
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("can not init HdiDrmComposition"));
+    mComposer = std::make_unique<HdiComposer>(std::move(preComp), std::move(postComp));
+    ret = mCrtc->BindToDisplay(GetId());
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("bind crtc failed"));
+
+    ret = ChosePreferenceMode();
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("choose preference mode fialed"));
     return DISPLAY_SUCCESS;
 }
 
-int32_t HdiDrmComposition::SetLayers(std::vector<HdiLayer *> &layers, HdiLayer &clientLayer)
+int32_t DrmDisplay::GetDisplayCapability(DisplayCapability *info)
 {
-    // now we do not surpport present direct
+    mConnector->GetDisplayCap(*info);
+    return DISPLAY_SUCCESS;
+}
+
+int32_t DrmDisplay::GetDisplaySupportedModes(uint32_t *num, DisplayModeInfo *modes)
+{
+    mConnector->GetDisplaySupportedModes(num, modes);
+    return DISPLAY_SUCCESS;
+}
+
+int32_t DrmDisplay::GetDisplayMode(uint32_t *modeId)
+{
+    DISPLAY_CHK_RETURN((modeId == nullptr), DISPLAY_NULL_PTR, DISPLAY_LOGE("the in modeId is nullptr"));
+    *modeId = mCrtc->GetActiveModeId();
+    return DISPLAY_SUCCESS;
+}
+
+int32_t DrmDisplay::SetDisplayMode(uint32_t modeId)
+{
+    // oneir: display modes: номер режима — индекс в списке режимов коннектора (GetDisplaySupportedModes)
+    DrmMode mode;
+    DISPLAY_CHK_RETURN((mConnector->GetModeFromId(static_cast<int32_t>(modeId), mode) != DISPLAY_SUCCESS),
+        DISPLAY_PARAM_ERR, DISPLAY_LOGE("mode %{public}u is not supported by the connector", modeId));
+    DISPLAY_LOGI("set display mode %{public}u", modeId);
+    return mCrtc->SetActivieMode(static_cast<int32_t>(modeId));
+}
+
+int32_t DrmDisplay::GetDisplayPowerStatus(DispPowerStatus *status)
+{
+    DISPLAY_CHK_RETURN((status == nullptr), DISPLAY_NULL_PTR, DISPLAY_LOGE("status is nullptr"));
+    return ConvertToHdiPowerState(mConnector->GetDpmsState(), *status);
+}
+
+int32_t DrmDisplay::SetDisplayPowerStatus(DispPowerStatus status)
+{
+    DISPLAY_LOGD("the status %{public}d ", status);
+    uint32_t drmPowerState = 0;
+    int ret = ConvertToDrmPowerState(status, drmPowerState);
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_PARAM_ERR,
+        DISPLAY_LOGE("unknown power status %{public}d", status));
+    mConnector->SetDpmsState(drmPowerState);
+    return DISPLAY_SUCCESS;
+}
+
+int32_t DrmDisplay::ConvertToHdiPowerState(uint32_t drmPowerState, DispPowerStatus &hdiPowerState)
+{
+    int32_t ret = DISPLAY_SUCCESS;
+    switch (drmPowerState) {
+        case DRM_MODE_DPMS_OFF:
+            hdiPowerState = POWER_STATUS_OFF;
+            break;
+        case DRM_MODE_DPMS_ON:
+            hdiPowerState = POWER_STATUS_ON;
+            break;
+        case DRM_MODE_DPMS_STANDBY:
+            hdiPowerState = POWER_STATUS_STANDBY;
+            break;
+        case DRM_MODE_DPMS_SUSPEND:
+            hdiPowerState = POWER_STATUS_SUSPEND;
+            break;
+        default:
+            hdiPowerState = POWER_STATUS_BUTT;
+            ret = DISPLAY_FAILURE;
+            break;
+    }
+    DISPLAY_LOGD("hdi power state %{public}u", hdiPowerState);
+    return ret;
+}
+
+int32_t DrmDisplay::ConvertToDrmPowerState(DispPowerStatus hdiPowerState, uint32_t &drmPowerState)
+{
+    int32_t ret = DISPLAY_SUCCESS;
+    switch (hdiPowerState) {
+        case POWER_STATUS_OFF:
+            drmPowerState = DRM_MODE_DPMS_OFF;
+            break;
+        case POWER_STATUS_ON:
+            drmPowerState = DRM_MODE_DPMS_ON;
+            break;
+        case POWER_STATUS_STANDBY:
+            drmPowerState = DRM_MODE_DPMS_STANDBY;
+            break;
+        case POWER_STATUS_SUSPEND:
+            drmPowerState = DRM_MODE_DPMS_SUSPEND;
+            break;
+        default:
+            ret = DISPLAY_FAILURE;
+            break;
+    }
+    return ret;
+}
+
+std::unique_ptr<HdiLayer> DrmDisplay::CreateHdiLayer(LayerType type)
+{
     DISPLAY_LOGD();
-    mCompLayers.clear();
-    mCompLayers.push_back(&clientLayer);
-    return DISPLAY_SUCCESS;
+    return std::make_unique<HdiDrmLayer>(type);
 }
 
-int32_t HdiDrmComposition::SetCrtcProperty(DrmPlane &drmPlane,
-                                           drmModeAtomicReqPtr pset,
-                                           int32_t bufferW,
-                                           int32_t bufferH)
+int32_t DrmDisplay::WaitForVBlank(uint64_t *ns)
 {
-    int ret;
-
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropCrtc_xId(), 0);
-    DISPLAY_LOGD("set the fb planeid %{public}d, GetPropCrtc_xId %{public}d, crop.x %{public}d", drmPlane.GetId(),
-        drmPlane.GetPropCrtc_xId(), 0);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the fb planeid fialed errno : %{public}d", errno));
-
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropCrtc_yId(), 0);
-    DISPLAY_LOGD("set the fb planeid %{public}d, GetPropCrtc_yId %{public}d, crop.y %{public}d", drmPlane.GetId(),
-        drmPlane.GetPropCrtc_yId(), 0);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the fb planeid fialed errno : %{public}d", errno));
-
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropCrtc_wId(), bufferW);
-    DISPLAY_LOGD("set the fb planeid %{public}d, GetPropCrtc_wId %{public}d, crop.w %{public}d", drmPlane.GetId(),
-        drmPlane.GetPropCrtc_wId(), bufferW);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the fb planeid fialed errno : %{public}d", errno));
-
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropCrtc_hId(), bufferH);
-    DISPLAY_LOGD("set the fb planeid %{public}d, GetPropCrtc_hId %{public}d, crop.h %{public}d", drmPlane.GetId(),
-        drmPlane.GetPropCrtc_xId(), bufferH);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the fb planeid fialed errno : %{public}d", errno));
-
+    struct timespec curTime = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &curTime);
+    usleep(16666);
+    // 1000000000 is used for transfer second to nsec
+    uint64_t duration = static_cast<uint64_t>(curTime.tv_sec) * 1000000 + static_cast<uint64_t>(curTime.tv_nsec);
+    *ns = static_cast<uint64_t>(duration);
     return DISPLAY_SUCCESS;
 }
 
-int32_t HdiDrmComposition::SetSrcProperty(DrmPlane &drmPlane,
-                                          drmModeAtomicReqPtr pset,
-                                          int32_t bufferW,
-                                          int32_t bufferH)
+bool DrmDisplay::IsConnected()
 {
-    int ret;
-
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropSrc_xId(), 0 << 16); // 16:shift left 16 bits
-    DISPLAY_LOGD("set the fb planeid %{public}d, GetPropSrc_xId %{public}d, displayRect.x %{public}d",
-        drmPlane.GetId(), drmPlane.GetPropSrc_xId(), 0);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the fb planeid fialed errno : %{public}d", errno));
-
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropSrc_yId(), 0 << 16); // 16:shift left 16 bits
-    DISPLAY_LOGD("set the fb planeid %{public}d, GetPropSrc_yId %{public}d, displayRect.y %{public}d",
-        drmPlane.GetId(), drmPlane.GetPropSrc_yId(), 0);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the fb planeid fialed errno : %{public}d", errno));
-
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropSrc_wId(),
-                                   bufferW << 16); // 16:shift left 16 bits
-    DISPLAY_LOGD("set the fb planeid %{public}d, GetPropCrtc_wId %{public}d, displayRect.w %{public}d",
-        drmPlane.GetId(), drmPlane.GetPropSrc_wId(), bufferW);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the fb planeid fialed errno : %{public}d", errno));
-
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropSrc_hId(),
-        bufferH << 16); // 16:shift left 16 bits
-    DISPLAY_LOGD("set the fb planeid %{public}d, GetPropSrc_hId %{public}d, displayRect.h %{public}d",
-        drmPlane.GetId(), drmPlane.GetPropSrc_hId(), bufferH);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the fb planeid fialed errno : %{public}d", errno));
-
-    return DISPLAY_SUCCESS;
+    DISPLAY_LOGD("conneted %{public}d", mConnector->IsConnected());
+    return mConnector->IsConnected();
 }
 
-int32_t HdiDrmComposition::ApplyPlane(HdiDrmLayer &layer,
-                                      HdiLayer &hlayer,
-                                      DrmPlane &drmPlane,
-                                      drmModeAtomicReqPtr pset)
+int32_t DrmDisplay::PushFirstFrame()
 {
-    int ret;
-    int fenceFd = layer.GetAcquireFenceFd();
-    int propId = drmPlane.GetPropFenceInId();
-    HdiLayerBuffer *layerBuffer = hlayer.GetCurrentBuffer();
-    int32_t bufferW = layerBuffer->GetWight();
-    int32_t bufferH = layerBuffer->GetHeight();
+    std::shared_ptr<IDisplayBufferVdi> hdiImpl = std::make_shared<DisplayBufferVdiImpl>();
+    int ret = DISPLAY_SUCCESS;
+    DrmMode mode;
+    ret = mConnector->GetModeFromId(mCrtc->GetActiveModeId(), mode);
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE,
+        DISPLAY_LOGE("can not get the mode from id %{public}d", mCrtc->GetActiveModeId()));
+    const AllocInfo info = {
+        .width = mode.GetModeInfoPtr()->hdisplay,
+        .height = mode.GetModeInfoPtr()->vdisplay,
+        .usage = HBM_USE_MEM_DMA | HBM_USE_CPU_READ | HBM_USE_CPU_WRITE,
+        .format = PIXEL_FMT_RGBX_8888
+    };
 
-    DISPLAY_LOGD();
-    if (propId != 0) {
-        DISPLAY_LOGD("set the fence in prop");
-        if (fenceFd >= 0) {
-            ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), propId, fenceFd);
-            DISPLAY_LOGD("set the IfenceProp plane id %{public}d, propId %{public}d, fenceFd %{public}d",
-                drmPlane.GetId(), propId, fenceFd);
-            DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set IN_FENCE_FD failed"));
-        }
-    }
+    BufferHandle *buffer = nullptr;
+    ret = hdiImpl->AllocMem(info, buffer);
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("can not alloc memory"));
+    mClientLayer->SetLayerBuffer(buffer, -1);
 
-    ret = SetCrtcProperty(drmPlane, pset, bufferW, bufferH);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set Crtc fialed errno : %{public}d", errno));
-
-    ret = SetSrcProperty(drmPlane, pset, bufferW, bufferH);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set Src fialed errno : %{public}d", errno));
-
-
-    // set fb id
-    DrmGemBuffer *gemBuffer = layer.GetGemBuffer();
-    DISPLAY_CHK_RETURN((gemBuffer == nullptr), DISPLAY_FAILURE, DISPLAY_LOGE("current gemBuffer is nullptr"));
-    DISPLAY_CHK_RETURN((!gemBuffer->IsValid()), DISPLAY_FAILURE, DISPLAY_LOGE("the DrmGemBuffer is invalid"));
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropFbId(), gemBuffer->GetFbId());
-    DISPLAY_LOGD("set the fb planeid %{public}d, propId %{public}d, fbId %{public}d",
-        drmPlane.GetId(), drmPlane.GetPropFbId(), gemBuffer->GetFbId());
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set fb id fialed errno : %{public}d", errno));
-
-    // set crtc id
-    ret = drmModeAtomicAddProperty(pset, drmPlane.GetId(), drmPlane.GetPropCrtcId(), mCrtc->GetId());
-    DISPLAY_LOGD("set the crtc planeId %{public}d, propId %{public}d, crtcId %{public}d",
-        drmPlane.GetId(), drmPlane.GetPropCrtcId(), mCrtc->GetId());
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set crtc id fialed errno : %{public}d", errno));
+    std::vector<HdiLayer *> layers;
+    HdiDrmComposition *drmComp = static_cast<HdiDrmComposition *>(mComposer->GetPostCompostion());
+    drmComp->SetLayers(layers, *mClientLayer);
+    drmComp->Apply(true);
     return DISPLAY_SUCCESS;
 }
 
-int32_t HdiDrmComposition::UpdateMode(std::unique_ptr<DrmModeBlock> &modeBlock)
+int32_t DrmDisplay::ChosePreferenceMode()
 {
-    // set the mode
-    DISPLAY_LOGD();
-    if (mCrtc->NeedModeSet()) {
-        int drmFd = mDrmDevice->GetDrmFd();
-        // oneir: display modes: запрос освобождается на всех путях (раньше утекал)
-        std::unique_ptr<drmModeAtomicReq, void (*)(drmModeAtomicReqPtr)> psetGuard(drmModeAtomicAlloc(),
-            drmModeAtomicFree);
-        drmModeAtomicReqPtr pset = psetGuard.get();
-        DISPLAY_CHK_RETURN((pset == nullptr), DISPLAY_FAILURE, DISPLAY_LOGE("drmModeAtomicAlloc failed"));
-        modeBlock = mConnector->GetModeBlockFromId(mCrtc->GetActiveModeId());
-        if ((modeBlock != nullptr) && (modeBlock->GetBlockId() != DRM_INVALID_ID)) {
-            // set to active
-            DISPLAY_LOGD("set crtc to active");
-            int ret = drmModeAtomicAddProperty(pset, mCrtc->GetId(), mCrtc->GetActivePropId(), 1);
-            DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE,
-                DISPLAY_LOGE("can not add the active prop errno %{public}d", errno));
-
-            // set the mode id
-            DISPLAY_LOGD("set the mode");
-            ret = drmModeAtomicAddProperty(pset, mCrtc->GetId(), mCrtc->GetModePropId(), modeBlock->GetBlockId());
-            DISPLAY_LOGD("set the mode planeId %{public}d, propId %{public}d, GetBlockId: %{public}d",
-                mCrtc->GetId(), mCrtc->GetModePropId(), modeBlock->GetBlockId());
-            DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE,
-                DISPLAY_LOGE("can not add the mode prop errno %{public}d", errno));
-            ret = drmModeAtomicAddProperty(pset, mConnector->GetId(), mConnector->GetPropCrtcId(), mCrtc->GetId());
-            DISPLAY_LOGD("set the connector id: %{public}d, propId %{public}d, crtcId %{public}d",
-                mConnector->GetId(), mConnector->GetPropCrtcId(), mCrtc->GetId());
-            DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE,
-                DISPLAY_LOGE("can not add the crtc id prop %{public}d", errno));
-
-            uint32_t flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
-            WaitPrevCommit(mCrtc->GetId(), 100); // oneir: display modes: не застать незавершённый коммит кадра
-            ret = drmModeAtomicCommit(drmFd, pset, flags, nullptr);
-            DISPLAY_CHK_RETURN((ret != 0), DISPLAY_FAILURE,
-                DISPLAY_LOGE("drmModeAtomicCommit failed %{public}d errno %{public}d", ret, errno));
-            mCrtc->ClearModeSet();
-        }
+    int32_t ret;
+    int32_t modeId = mConnector->GetPreferenceId();
+    if (modeId == INVALID_MODE_ID) {
+        uint32_t num = 0;
+        ret = GetDisplaySupportedModes(&num, nullptr);
+        DISPLAY_CHK_RETURN((num == 0) && (ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("can not get modes"));
+        modeId = 0;
     }
-    return DISPLAY_SUCCESS;
+    ret = SetDisplayMode(modeId);
+    // Push first frame to the drm, for that the vblank must init all the componet.
+    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("set display mode failed"));
+    return PushFirstFrame();
 }
 
-int32_t HdiDrmComposition::RemoveUnusePlane(drmModeAtomicReqPtr pset)
+int32_t DrmDisplay::RegDisplayVBlankCallback(VBlankCallback cb, void *data)
 {
-    int ret = 0;
-    /* Remove useless planes from the drm */
-    for (uint32_t j = 0; j < mPlanes.size(); j++) {
-        auto &drmPlane = mPlanes[j];
-        if (drmPlane->GetPipe() == 0) {
-            DISPLAY_LOGD("no used plane id %{public}d", drmPlane->GetId());
-            ret = drmModeAtomicAddProperty(pset, drmPlane->GetId(), drmPlane->GetPropFbId(), 0);
-            ret = drmModeAtomicAddProperty(pset, drmPlane->GetId(), drmPlane->GetPropFbId(), 0);
-            drmPlane->UnBindPipe();
-        }
-    }
+    (void)data;
+    std::shared_ptr<VsyncCallBack> vsyncCb = std::make_shared<VsyncCallBack>(cb, data, mCrtc->GetPipe());
+    DrmVsyncWorker::GetInstance().ReqesterVBlankCb(vsyncCb);
     return DISPLAY_SUCCESS;
 }
 
-int32_t HdiDrmComposition::FindPlaneAndApply(drmModeAtomicReqPtr pset)
+int32_t DrmDisplay::SetDisplayVsyncEnabled(bool enabled)
 {
-    int32_t ret = 0;
-    for (uint32_t i = 0; i < mCompLayers.size(); i++) {
-        HdiDrmLayer *layer = static_cast<HdiDrmLayer *>(mCompLayers[i]);
-        HdiLayer *hlayer = mCompLayers[i];
-        for (uint32_t j = 0; j < mPlanes.size(); j++) {
-            auto &drmPlane = mPlanes[j];
-            if (drmPlane->GetPipe() != 0 && drmPlane->GetPipe() != (1 << mCrtc->GetPipe())) {
-                DISPLAY_LOGD("plane %{public}d used pipe %{public}d crtc pipe %{public}d", drmPlane->GetId(),
-                    drmPlane->GetPipe(), mCrtc->GetPipe());
-                continue;
-            }
-
-            if (drmPlane->GetCrtcId() == mCrtc->GetId() || drmPlane->GetCrtcId() == 0) {
-                ret = ApplyPlane(*layer, *hlayer, *drmPlane, pset);
-                if (ret != DISPLAY_SUCCESS) {
-                    DISPLAY_LOGE("apply plane failed");
-                    break;
-                }
-                /* mark the plane is used by crtc */
-                drmPlane->BindToPipe(1 << mCrtc->GetPipe());
-                break;
-            }
-        }
-    }
+    DISPLAY_LOGD("enable %{public}d", enabled);
+    DrmVsyncWorker::GetInstance().EnableVsync(enabled);
     return DISPLAY_SUCCESS;
 }
 
-int32_t HdiDrmComposition::Apply(bool modeSet)
+int32_t DrmDisplay::GetDisplayBacklight(uint32_t *value)
 {
-    uint64_t crtcOutFence = -1;
-    int ret = 0;
-    std::unique_ptr<DrmModeBlock> modeBlock;
-    int drmFd = mDrmDevice->GetDrmFd();
-
-    ret = UpdateMode(modeBlock);
-    DISPLAY_CHK_RETURN((ret != DISPLAY_SUCCESS), DISPLAY_FAILURE, DISPLAY_LOGE("update mode failed"));
-
-    DISPLAY_LOGD("mPlane size: %{public}zd mCompLayers size: %{public}zd", mPlanes.size(), mCompLayers.size());
-    DISPLAY_CHK_RETURN((mPlanes.size() < mCompLayers.size()), DISPLAY_FAILURE, DISPLAY_LOGE("plane not enough"));
-    drmModeAtomicReqPtr pset = drmModeAtomicAlloc();
-    DISPLAY_CHK_RETURN((pset == nullptr), DISPLAY_NULL_PTR,
-        DISPLAY_LOGE("drm atomic alloc failed errno %{public}d", errno));
-    AtomicReqPtr atomicReqPtr = AtomicReqPtr(pset);
-
-    // set the outFence property
-    ret = drmModeAtomicAddProperty(atomicReqPtr.Get(), mCrtc->GetId(), mCrtc->GetOutFencePropId(),
-        (uint64_t)&crtcOutFence);
-
-    DISPLAY_LOGD("Apply Set OutFence crtc id: %{public}d, fencePropId %{public}d", mCrtc->GetId(),
-        mCrtc->GetOutFencePropId());
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE, DISPLAY_LOGE("set the outfence property of crtc failed "));
-
-    // set the plane info.
-    DISPLAY_LOGD("mCompLayers size %{public}zd", mCompLayers.size());
-    DISPLAY_LOGD("crtc id %{public}d connect id %{public}d encoder id %{public}d", mCrtc->GetId(),
-        mConnector->GetId(), mConnector->GetEncoderId());
-
-    /*  Bind the plane not used by other crtcs to the crtc. */
-    FindPlaneAndApply(atomicReqPtr.Get());
-    /* Remove useless planes from the drm */
-    RemoveUnusePlane(atomicReqPtr.Get());
-
-    ret = drmModeAtomicAddProperty(pset, mConnector->GetId(), mConnector->GetPropCrtcId(), mCrtc->GetId());
-    DISPLAY_LOGD("set the connector id: %{public}d, propId %{public}d, crtcId %{public}d", mConnector->GetId(),
-        mConnector->GetPropCrtcId(), mCrtc->GetId());
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE,
-        DISPLAY_LOGE("can not add the crtc id prop %{public}d", errno));
-
-    // set to active
-    DISPLAY_LOGD("set crtc to active");
-    ret = drmModeAtomicAddProperty(pset, mCrtc->GetId(), mCrtc->GetActivePropId(), 1);
-    DISPLAY_CHK_RETURN((ret < 0), DISPLAY_FAILURE,
-        DISPLAY_LOGE("can not add the active prop errno %{public}d", errno));
-
-    // oneir: отладочные переключатели для поиска причины мерцания (системные параметры, без перезапуска).
-    //   oneir.composer.cpuwait=1          — перед коммитом ждать acquire fence слоёв на CPU (до 100 мс)
-    //   persist.oneir.composer.nonblock=1 — неблокирующий атомарный коммит (по умолчанию блокирующий)
-    if (ParamEnabled("oneir.composer.cpuwait")) {
-        for (auto layer : mCompLayers) {
-            int fd = layer->GetAcquireFenceFd();
-            if (fd >= 0) {
-                struct pollfd pfd = {fd, POLLIN, 0};
-                int pr = poll(&pfd, 1, 100);
-                DISPLAY_LOGD("cpuwait: layer %{public}d fence %{public}d poll %{public}d", layer->GetId(), fd, pr);
-            }
-        }
-    }
-    // oneir: по умолчанию блокирующий коммит — кадр выведен к моменту возврата, коммиты не
-    // накладываются (неблокирующий режим давал EBUSY и мерцание движущихся объектов).
-    uint32_t flags = ParamEnabled("persist.oneir.composer.nonblock") ? DRM_MODE_ATOMIC_NONBLOCK : 0;
-
-    // oneir: flip events: в неблокирующем режиме — ждать события завершения предыдущей смены кадра и
-    // запрашивать событие для этого коммита; в блокирующем — как раньше.
-    const uint32_t crtcId = mCrtc->GetId();
-    const bool nonblock = (flags & DRM_MODE_ATOMIC_NONBLOCK) != 0;
-    void *userData = nullptr;
-    if (nonblock) {
-        auto &tracker = FlipTracker::Instance();
-        tracker.EnsureStarted(drmFd);
-        if (!tracker.WaitIdle(crtcId, FLIP_WAIT_MS)) {
-            DISPLAY_LOGW("page flip event not received in %{public}d ms", FLIP_WAIT_MS);
-            tracker.ClearPending(crtcId); // событие потеряно — не блокировать вывод навсегда
-        }
-        flags |= DRM_MODE_PAGE_FLIP_EVENT;
-        userData = reinterpret_cast<void *>(static_cast<uintptr_t>(crtcId));
-        tracker.MarkPending(crtcId);
-    } else {
-        WaitPrevCommit(crtcId, 50);
-    }
-    auto commitStart = std::chrono::steady_clock::now();
-    ret = drmModeAtomicCommit(drmFd, atomicReqPtr.Get(), flags, userData);
-    for (int attempt = 1; ret != 0 && errno == EBUSY && attempt <= EBUSY_RETRIES; attempt++) {
-        DISPLAY_LOGW("drmModeAtomicCommit busy, retry %{public}d", attempt);
-        WaitPrevCommit(crtcId, 20);
-        usleep(1000);
-        ret = drmModeAtomicCommit(drmFd, atomicReqPtr.Get(), flags, userData);
-    }
-    if (ret != 0 && nonblock) {
-        FlipTracker::Instance().ClearPending(crtcId); // события не будет
-    }
-    DISPLAY_LOGD("commit %{public}s %{public}lld us", nonblock ? "nonblock" : "block",
-        static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - commitStart).count()));
-    DISPLAY_CHK_RETURN((ret != 0), DISPLAY_FAILURE,
-        DISPLAY_LOGE("drmModeAtomicCommit failed %{public}d errno %{public}d", ret, errno));
-    StorePrevCommit(mCrtc->GetId(), static_cast<int>(crtcOutFence));
-    // set the release fence
-    for (auto layer : mCompLayers) {
-        layer->SetReleaseFence(static_cast<int>(crtcOutFence));
-    }
-
-    return DISPLAY_SUCCESS;
+    DISPLAY_CHK_RETURN((value == nullptr), DISPLAY_NULL_PTR, DISPLAY_LOGE("value is nullptr"));
+    return mConnector->GetBrightness(*value);
 }
-} // OHOS
-} // HDI
-} // DISPLAY
+
+int32_t DrmDisplay::SetDisplayBacklight(uint32_t value)
+{
+    return mConnector->SetBrightness(value);
+}
+} // namespace OHOS
+} // namespace HDI
+} // namespace DISPLAY
