@@ -231,7 +231,11 @@ int32_t HdiDrmComposition::UpdateMode(std::unique_ptr<DrmModeBlock> &modeBlock)
     DISPLAY_LOGD();
     if (mCrtc->NeedModeSet()) {
         int drmFd = mDrmDevice->GetDrmFd();
-        drmModeAtomicReqPtr pset = drmModeAtomicAlloc();
+        // oneir: display modes: запрос освобождается на всех путях (раньше утекал)
+        std::unique_ptr<drmModeAtomicReq, void (*)(drmModeAtomicReqPtr)> psetGuard(drmModeAtomicAlloc(),
+            drmModeAtomicFree);
+        drmModeAtomicReqPtr pset = psetGuard.get();
+        DISPLAY_CHK_RETURN((pset == nullptr), DISPLAY_FAILURE, DISPLAY_LOGE("drmModeAtomicAlloc failed"));
         modeBlock = mConnector->GetModeBlockFromId(mCrtc->GetActiveModeId());
         if ((modeBlock != nullptr) && (modeBlock->GetBlockId() != DRM_INVALID_ID)) {
             // set to active
@@ -254,6 +258,7 @@ int32_t HdiDrmComposition::UpdateMode(std::unique_ptr<DrmModeBlock> &modeBlock)
                 DISPLAY_LOGE("can not add the crtc id prop %{public}d", errno));
 
             uint32_t flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+            WaitPrevCommit(mCrtc->GetId(), 100); // oneir: display modes: не застать незавершённый коммит кадра
             ret = drmModeAtomicCommit(drmFd, pset, flags, nullptr);
             DISPLAY_CHK_RETURN((ret != 0), DISPLAY_FAILURE,
                 DISPLAY_LOGE("drmModeAtomicCommit failed %{public}d errno %{public}d", ret, errno));
