@@ -94,7 +94,12 @@ int32_t DrmDisplay::GetDisplayMode(uint32_t *modeId)
 
 int32_t DrmDisplay::SetDisplayMode(uint32_t modeId)
 {
-    return mCrtc->SetActivieMode(modeId);
+    // oneir: display modes: номер режима — индекс в списке режимов коннектора (GetDisplaySupportedModes)
+    DrmMode mode;
+    DISPLAY_CHK_RETURN((mConnector->GetModeFromId(static_cast<int32_t>(modeId), mode) != DISPLAY_SUCCESS),
+        DISPLAY_PARAM_ERR, DISPLAY_LOGE("mode %{public}u is not supported by the connector", modeId));
+    DISPLAY_LOGI("set display mode %{public}u", modeId);
+    return mCrtc->SetActivieMode(static_cast<int32_t>(modeId));
 }
 
 int32_t DrmDisplay::GetDisplayPowerStatus(DispPowerStatus *status)
