@@ -1,6 +1,6 @@
 # display_composer
 
-
+`display_composer` — это низкоуровневый драйверный слой (HDI/HDF), который общается непосредственно с железом экрана и ядром Linux (через DRM/KMS драйвер и `display_buffer`).
 
 Composer читает системный параметр `persist.oneir.composer.nonblock` и `oneir.composer.cpuwait`:
 |Параметр|Значение по умолчанию|Что делает|
