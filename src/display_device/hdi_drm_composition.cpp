@@ -16,6 +16,11 @@
 #include "hdi_drm_composition.h"
 #include <cerrno>
 #include <poll.h>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <thread>
+#include <xf86drm.h>
 #include "param/sys_param.h"
 #include <map>
 #include <string>
@@ -78,6 +83,88 @@ bool ParamEnabled(const char *name)
     const char *v = it->second ? CachedParameterGet(it->second) : nullptr;
     return v != nullptr && v[0] == '1';
 }
+
+// oneir: flip events: отслеживание завершения смены кадра по событиям DRM.
+// Ядро отвергает неблокирующий коммит (EBUSY), пока у предыдущего не завершён flip_done; событие
+// DRM_MODE_PAGE_FLIP_EVENT приходит ровно в этот момент. Поток событий читает их из fd DRM и
+// снимает отметку «смена кадра в процессе» для CRTC.
+class FlipTracker {
+public:
+    void EnsureStarted(int fd)
+    {
+        std::call_once(once_, [this, fd]() {
+            fd_ = fd;
+            std::thread([this]() { Loop(); }).detach();
+        });
+    }
+
+    void MarkPending(uint32_t crtcId)
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        pending_[crtcId] = true;
+    }
+
+    void ClearPending(uint32_t crtcId)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            pending_[crtcId] = false;
+        }
+        cv_.notify_all();
+    }
+
+    // true — смена кадра завершена (или её не было); false — таймаут
+    bool WaitIdle(uint32_t crtcId, int timeoutMs)
+    {
+        std::unique_lock<std::mutex> lock(mu_);
+        return cv_.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this, crtcId]() {
+            auto it = pending_.find(crtcId);
+            return it == pending_.end() || !it->second;
+        });
+    }
+
+private:
+    static void OnFlip(int, unsigned int, unsigned int, unsigned int, unsigned int crtcId, void *userData)
+    {
+        // номер CRTC приходит в событии, если ядро поддерживает DRM_CAP_CRTC_IN_VBLANK_EVENT
+        // (Linux >= 4.12); иначе 0 — тогда берём его из user_data, переданного в коммит
+        if (crtcId == 0) {
+            crtcId = static_cast<unsigned int>(reinterpret_cast<uintptr_t>(userData));
+        }
+        Instance().ClearPending(crtcId);
+    }
+
+    void Loop()
+    {
+        drmEventContext ev = {};
+        ev.version = 3; // page_flip_handler2 (с номером CRTC)
+        ev.page_flip_handler2 = &FlipTracker::OnFlip;
+        while (true) {
+            struct pollfd pfd = {fd_, POLLIN, 0};
+            int r = poll(&pfd, 1, 1000);
+            if (r > 0 && (pfd.revents & POLLIN)) {
+                drmHandleEvent(fd_, &ev);
+            }
+        }
+    }
+
+public:
+    static FlipTracker &Instance()
+    {
+        static FlipTracker tracker;
+        return tracker;
+    }
+
+private:
+    std::once_flag once_;
+    int fd_ = -1;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::map<uint32_t, bool> pending_;
+};
+
+constexpr int FLIP_WAIT_MS = 100;
+constexpr int EBUSY_RETRIES = 3;
 } // namespace
 
 namespace OHOS {
@@ -377,13 +464,38 @@ int32_t HdiDrmComposition::Apply(bool modeSet)
     // накладываются (неблокирующий режим давал EBUSY и мерцание движущихся объектов).
     uint32_t flags = ParamEnabled("persist.oneir.composer.nonblock") ? DRM_MODE_ATOMIC_NONBLOCK : 0;
 
-    WaitPrevCommit(mCrtc->GetId(), 50);
-    ret = drmModeAtomicCommit(drmFd, atomicReqPtr.Get(), flags, nullptr);
-    if (ret != 0 && errno == EBUSY) {
-        DISPLAY_LOGW("drmModeAtomicCommit busy, wait for the previous commit and retry");
-        WaitPrevCommit(mCrtc->GetId(), 100);
-        ret = drmModeAtomicCommit(drmFd, atomicReqPtr.Get(), flags, nullptr);
+    // oneir: flip events: в неблокирующем режиме — ждать события завершения предыдущей смены кадра и
+    // запрашивать событие для этого коммита; в блокирующем — как раньше.
+    const uint32_t crtcId = mCrtc->GetId();
+    const bool nonblock = (flags & DRM_MODE_ATOMIC_NONBLOCK) != 0;
+    void *userData = nullptr;
+    if (nonblock) {
+        auto &tracker = FlipTracker::Instance();
+        tracker.EnsureStarted(drmFd);
+        if (!tracker.WaitIdle(crtcId, FLIP_WAIT_MS)) {
+            DISPLAY_LOGW("page flip event not received in %{public}d ms", FLIP_WAIT_MS);
+            tracker.ClearPending(crtcId); // событие потеряно — не блокировать вывод навсегда
+        }
+        flags |= DRM_MODE_PAGE_FLIP_EVENT;
+        userData = reinterpret_cast<void *>(static_cast<uintptr_t>(crtcId));
+        tracker.MarkPending(crtcId);
+    } else {
+        WaitPrevCommit(crtcId, 50);
     }
+    auto commitStart = std::chrono::steady_clock::now();
+    ret = drmModeAtomicCommit(drmFd, atomicReqPtr.Get(), flags, userData);
+    for (int attempt = 1; ret != 0 && errno == EBUSY && attempt <= EBUSY_RETRIES; attempt++) {
+        DISPLAY_LOGW("drmModeAtomicCommit busy, retry %{public}d", attempt);
+        WaitPrevCommit(crtcId, 20);
+        usleep(1000);
+        ret = drmModeAtomicCommit(drmFd, atomicReqPtr.Get(), flags, userData);
+    }
+    if (ret != 0 && nonblock) {
+        FlipTracker::Instance().ClearPending(crtcId); // события не будет
+    }
+    DISPLAY_LOGD("commit %{public}s %{public}lld us", nonblock ? "nonblock" : "block",
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - commitStart).count()));
     DISPLAY_CHK_RETURN((ret != 0), DISPLAY_FAILURE,
         DISPLAY_LOGE("drmModeAtomicCommit failed %{public}d errno %{public}d", ret, errno));
     StorePrevCommit(mCrtc->GetId(), static_cast<int>(crtcOutFence));
