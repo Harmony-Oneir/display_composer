@@ -73,6 +73,7 @@ sudo ls -l /proc/$P/fd | grep dri
 Для тестирования на Qemu можно использовать следующую команду:
 
 ```bash
+xhost +SI:localuser:root
 sudo qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 2G -machine q35 \
   -kernel out/kernel/OBJ/linux-6.6/arch/x86/boot/bzImage \
   -drive file=out/oneir/ohos-root.img,format=raw,if=virtio,snapshot=on \
