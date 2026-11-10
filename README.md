@@ -90,7 +90,12 @@ sudo qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 2G -machine q35 \
 * `out/kernel/OBJ/linux-6.6/drivers/gpu/drm/virtio/virtio-gpu.ko`
 
 Ручная загрузка модулей:
-```
+```bash
 insmod /vendor/modules/virtio_dma_buf.ko
 insmod /vendor/modules/virtio-gpu.ko
+# проверка
+ls /dev/dri/
+card0  renderD128
+cat /sys/class/drm/card0-*/status 
+connected
 ```
