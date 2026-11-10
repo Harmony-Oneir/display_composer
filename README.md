@@ -85,3 +85,6 @@ sudo qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 2G -machine q35 \
   -serial mon:stdio \
   -append "root=/dev/vda rw console=ttyS0 selinux=0 hardware=x86_64_oneir init=/system/bin/init loglevel=0"
 ```
+Следующие модули должны быть помещены в образ по пути `vendor/modules/`:
+* `out/kernel/OBJ/linux-6.6/drivers/virtio/virtio_dma_buf.ko`
+* `out/kernel/OBJ/linux-6.6/drivers/gpu/drm/virtio/virtio-gpu.ko`
