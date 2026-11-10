@@ -96,6 +96,7 @@ insmod /vendor/modules/virtio-gpu.ko
 # проверка
 ls /dev/dri/
 card0  renderD128
+chmod 0666 /dev/dri/*
 cat /sys/class/drm/card0-*/status 
 connected
 ```
