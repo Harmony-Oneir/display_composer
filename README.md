@@ -69,3 +69,18 @@ sudo ls -l /proc/$P/fd | grep dri
 * `out/oneir/tests/unittest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_ut`
 * `out/oneir/tests/benchmark/drivers_peripheral_display/drivers_peripheral_display_composer/hdf_display_benchmark_test`
 * `out/oneir/tests/unittest/drivers_peripheral_display/drivers_peripheral_display_composer/composer_death_test`
+
+Для тестирования на Qemu можно использовать следующую команду:
+
+```bash
+sudo qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -m 2G -machine q35 \
+  -kernel out/kernel/OBJ/linux-6.6/arch/x86/boot/bzImage \
+  -drive file=out/oneir/ohos-root.img,format=raw,if=virtio,snapshot=on \
+  -drive file=out/oneir/userdata.img,format=raw,if=virtio \
+  -netdev user,id=n0,hostfwd=tcp:127.0.0.1:18710-:8710 \
+  -device e1000,netdev=n0 \
+  -device virtio-gpu-pci \
+  -display none -vnc 127.0.0.1:0 \
+  -serial mon:stdio \
+  -append "root=/dev/vda rw console=ttyS0 selinux=0 hardware=x86_64_oneir init=/system/bin/init loglevel=0"
+```
