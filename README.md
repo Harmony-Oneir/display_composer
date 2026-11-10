@@ -14,7 +14,7 @@ Composer читает системный параметр `persist.oneir.compose
 |`oneir.composer.cpuwait`|`0`|отладка: перед коммитом ждать acquire fence слоёв на CPU (до 100 мс)|
 
 ## Сборка
-Для сборки выполните команду `./make.sh --reload  //oneir/display_composer:display_composer` внутри контейнера. Результат сборки располагается по пути `out/oneir/oneir/oneir_display_composer`:
+Для сборки выполните команду `./make.sh --reload display_composer` внутри контейнера. Результат сборки располагается по пути `out/oneir/oneir/oneir_display_composer`:
 | Библиотека | Описание |
 |---|---|
 | `libdisplay_composer_vdi_impl.z.so` | Точка входа VDI композитора: экспортирует `CreateComposerVdi` / `DestroyComposerVdi` и функции интерфейса `IDisplayComposerVdi` (экраны, режимы, слои, prepare, commit, VSync). Загружается HDI-сервисом композитора через `dlopen` |
