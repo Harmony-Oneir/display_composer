@@ -100,3 +100,20 @@ chmod 0666 /dev/dri/*
 cat /sys/class/drm/card0-*/status 
 connected
 ```
+
+## Результаты тестов (QEMU)
+
+## Composer
+| Тест | Результат | Примечание |
+|---|---|---|
+| `composer_ut` | 62 / 65 ✅ | см. падения ниже |
+| `composer_death_test` | 2 / 2 ✅ | |
+
+
+Падения `composer_ut`:
+- `test_SetDisplayBacklight`: `-1`, у virtio-gpu нет подсветки (ожидаемо для VM).
+- `test_SetLayerCrop`, `test_SetLayerZorder`: не совпадает результат композиции. падает проверка пикселей (`CheckComposition`, строка 188). Причина: `libdisplay_gfx` — заглушка, `Blit`/`FillRect` возвращают `DISPLAY_SUCCESS` без отрисовки (`oneir/display_composer/src/display_gfx/display_gfx.c`), а `HdiGfxComposition` использует их для сведения слоёв в клиентский буфер.
+
+# TODO
+
+- Реализовать программные `Blit` и `FillRect` в `display_gfx.c` (копирование по `virAddr` с учётом crop, stride и альфа-смешивания из `GfxOpt`), либо подключить pixman.
