@@ -52,6 +52,7 @@ ohos_shared_library("oneir_display_composer_vendor") {
   ]
   deps = [ "//third_party/libdrm:libdrm" ]
   external_deps = [
+    "init:libbegetutil",
     "c_utils:utils",
     "drivers_interface_display:display_buffer_idl_headers",
     "drivers_interface_display:display_composer_idl_headers",
