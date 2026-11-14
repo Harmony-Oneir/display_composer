@@ -17,6 +17,7 @@
 #define DRM_PLANE_H
 #include <cinttypes>
 #include <string>
+#include <utility>
 #include <vector>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -47,6 +48,12 @@ const std::string PROP_SRC_X_ID = "SRC_X";
 const std::string PROP_SRC_Y_ID = "SRC_Y";
 const std::string PROP_SRC_W_ID = "SRC_W";
 const std::string PROP_SRC_H_ID = "SRC_H";
+
+// oneir: hwc — необязательные свойства плоскости (есть не на всём оборудовании)
+const std::string PROP_ZPOS = "zpos";
+const std::string PROP_ROTATION = "rotation";
+const std::string PROP_ALPHA = "alpha";
+const std::string PROP_PIXEL_BLEND_MODE = "pixel blend mode";
 
 class DrmDevice;
 
@@ -138,6 +145,35 @@ public:
         return mName;
     }
 
+    // oneir: hwc — возможности плоскости, прочитанные у ядра
+    bool SupportsFormat(uint32_t fourcc) const;
+    uint32_t GetPropZposId() const
+    {
+        return mPropZposId;
+    }
+    uint64_t GetZpos() const
+    {
+        return mZpos;
+    }
+    bool IsZposImmutable() const
+    {
+        return mZposImmutable;
+    }
+    uint32_t GetPropAlphaId() const
+    {
+        return mPropAlphaId;
+    }
+    uint32_t GetPropRotationId() const
+    {
+        return mPropRotationId;
+    }
+    uint32_t GetPropBlendModeId() const
+    {
+        return mPropBlendModeId;
+    }
+    // значение перечисления «pixel blend mode» по имени («Pre-multiplied», «Coverage», «None»); -1 — нет
+    int64_t GetBlendModeValue(const std::string &name) const;
+
 private:
     uint32_t mId = 0;
     uint32_t mPossibleCrtcs = 0;
@@ -161,6 +197,16 @@ private:
     uint32_t mPipe = 0;
     uint32_t mType = 0;
     std::vector<uint32_t> mFormats;
+
+    // oneir: hwc
+    void ReadOptionalProps(DrmDevice &drmDevice);
+    uint32_t mPropZposId = 0;
+    uint64_t mZpos = 0;
+    bool mZposImmutable = true;
+    uint32_t mPropAlphaId = 0;
+    uint32_t mPropRotationId = 0;
+    uint32_t mPropBlendModeId = 0;
+    std::vector<std::pair<std::string, uint64_t>> mBlendModes;
 };
 } // namespace OHOS
 } // namespace HDI
