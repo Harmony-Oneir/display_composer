@@ -14,7 +14,9 @@
     "subsystem": "oneir",
     "syscap": [],
     "features": [],
-    "adapted_system_type": [ "standard" ],
+    "adapted_system_type": [
+      "standard"
+    ],
     "rom": "",
     "ram": "",
     "deps": {
@@ -25,6 +27,7 @@
         "hdf_core",
         "hilog",
         "hitrace",
+        "init",
         "ipc",
         "oneir_display"
       ],
