@@ -15,6 +15,8 @@
 
 #include "drm_plane.h"
 #include "drm_device.h"
+#include <algorithm>
+#include <cstring>
 
 namespace OHOS {
 namespace HDI {
@@ -124,7 +126,53 @@ int32_t DrmPlane::Init(DrmDevice &drmDevice)
             DISPLAY_LOGE("unknown type value %{public}" PRIu64 "", prop.value);
             return DISPLAY_FAILURE;
     }
+    ReadOptionalProps(drmDevice);
     return DISPLAY_SUCCESS;
+}
+
+// oneir: hwc — свойства, которых может не быть на другом оборудовании; их отсутствие не ошибка
+void DrmPlane::ReadOptionalProps(DrmDevice &drmDevice)
+{
+    DrmProperty prop;
+    if (drmDevice.GetPlaneProperty(*this, PROP_ZPOS, prop) == DISPLAY_SUCCESS) {
+        mPropZposId = prop.propId;
+        mZpos = prop.value;
+        mZposImmutable = (prop.flags & DRM_MODE_PROP_IMMUTABLE) != 0;
+    }
+    if (drmDevice.GetPlaneProperty(*this, PROP_ALPHA, prop) == DISPLAY_SUCCESS) {
+        mPropAlphaId = prop.propId;
+    }
+    if (drmDevice.GetPlaneProperty(*this, PROP_ROTATION, prop) == DISPLAY_SUCCESS) {
+        mPropRotationId = prop.propId;
+    }
+    if (drmDevice.GetPlaneProperty(*this, PROP_PIXEL_BLEND_MODE, prop) == DISPLAY_SUCCESS) {
+        mPropBlendModeId = prop.propId;
+        drmModePropertyPtr p = drmModeGetProperty(DrmDevice::GetDrmFd(), prop.propId);
+        if (p != nullptr) {
+            for (int i = 0; i < p->count_enums; i++) {
+                mBlendModes.emplace_back(p->enums[i].name, p->enums[i].value);
+            }
+            drmModeFreeProperty(p);
+        }
+    }
+    DISPLAY_LOGI("plane %{public}u type %{public}u formats %{public}zu zpos %{public}" PRIu64 "%{public}s "
+        "alpha %{public}d rotation %{public}d blend %{public}d", mId, mType, mFormats.size(), mZpos,
+        mZposImmutable ? " (fixed)" : "", mPropAlphaId != 0, mPropRotationId != 0, mPropBlendModeId != 0);
+}
+
+bool DrmPlane::SupportsFormat(uint32_t fourcc) const
+{
+    return std::find(mFormats.begin(), mFormats.end(), fourcc) != mFormats.end();
+}
+
+int64_t DrmPlane::GetBlendModeValue(const std::string &name) const
+{
+    for (const auto &m : mBlendModes) {
+        if (m.first == name) {
+            return static_cast<int64_t>(m.second);
+        }
+    }
+    return -1;
 }
 } // namespace OHOS
 } // namespace HDI
