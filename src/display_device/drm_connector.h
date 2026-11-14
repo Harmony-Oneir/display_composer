@@ -106,6 +106,11 @@ public:
     bool HandleHotplug(IdMapPtr<DrmEncoder> &encoders, IdMapPtr<DrmCrtc> &crtcs, bool plugIn);
     std::shared_ptr<DrmCrtc> UpdateCrtcId(IdMapPtr<DrmEncoder> &encoders, IdMapPtr<DrmCrtc> &crtcs,
         bool plugIn, drmModeConnectorPtr c, int *crtc_id);
+    // oneir: hwc — сколько слоёв дисплей выводит аппаратно (сообщается RS в GetDisplayCapability)
+    void SetSupportLayers(uint32_t count)
+    {
+        mSupportLayers = count;
+    }
     int32_t GetBrightness(uint32_t& level);
     int32_t SetBrightness(uint32_t level);
 
