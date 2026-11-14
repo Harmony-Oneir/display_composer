@@ -28,16 +28,21 @@ namespace DISPLAY {
 const int INVALID_DRM_ID = 0;
 class DrmGemBuffer {
 public:
-    DrmGemBuffer(int drmFd, HdiLayerBuffer &hdl);
+    // opaque = true — формат без альфы (X вместо A): для клиентского буфера на основной плоскости
+    DrmGemBuffer(int drmFd, HdiLayerBuffer &hdl, bool opaque = false);
     virtual ~DrmGemBuffer();
     uint32_t GetFbId() const
     {
         return mFdId;
     }
+    uint32_t GetDrmFormat() const
+    {
+        return mDrmFormat;
+    }
     bool IsValid();
 
 private:
-    void Init(int drmFd, HdiLayerBuffer &hdl);
+    void Init(int drmFd, HdiLayerBuffer &hdl, bool opaque);
     uint32_t mGemHandle = 0;
     uint32_t mFdId = 0;
     int mDrmFd = -1; // the fd can not close. the other module will close it.
@@ -49,11 +54,15 @@ public:
     explicit HdiDrmLayer(LayerType type) : HdiLayer(type) {}
     ~HdiDrmLayer() override {}
     // Return value optimization
-    DrmGemBuffer *GetGemBuffer();
+    // oneir: hwc — framebuffer создаётся один раз на буфер (повторный вызов для того же буфера
+    // возвращает тот же FB); предыдущий FB держится, пока новый не выведен.
+    DrmGemBuffer *GetGemBuffer(bool opaque = false);
 
 private:
     std::unique_ptr<DrmGemBuffer> mCurrentBuffer;
     std::unique_ptr<DrmGemBuffer> mLastBuffer;
+    uint64_t mCurrentKey = 0;  // dev/ino dma-buf текущего буфера
+    bool mCurrentOpaque = false;
 };
 } // namespace OHOS
 } // namespace HDI
