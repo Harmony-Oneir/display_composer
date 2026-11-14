@@ -56,11 +56,33 @@ public:
     int32_t UpdateMode(std::unique_ptr<DrmModeBlock> &modeBlock);
 
 private:
+    // oneir: hwc — геометрия слоя: область на экране (CRTC) и область источника (SRC, в пикселях)
+    struct PlaneRect {
+        int32_t x = 0;
+        int32_t y = 0;
+        int32_t w = 0;
+        int32_t h = 0;
+    };
+    // слой и выбранная для него плоскость (клиентский слой — на основной)
+    struct PlaneAssignment {
+        HdiLayer *layer = nullptr;
+        std::shared_ptr<DrmPlane> plane;
+        bool isClient = false;
+        uint32_t zposOrder = 0;
+        bool opaque = false;   // вывести как непрозрачный (формат без альфы) — нижний слой на основной плоскости
+    };
     int32_t ApplyPlane(HdiDrmLayer &layer, HdiLayer &hlayer, DrmPlane &drmPlane, drmModeAtomicReqPtr pset);
+    int32_t ApplyPlane(const PlaneAssignment &as, drmModeAtomicReqPtr pset, bool withFence);
     int32_t SetSrcProperty(DrmPlane &drmPlane, drmModeAtomicReqPtr pset, int32_t bufferW, int32_t bufferH);
     int32_t SetCrtcProperty(DrmPlane &drmPlane, drmModeAtomicReqPtr pset, int32_t bufferW, int32_t bufferH);
+    int32_t SetPlaneRects(DrmPlane &drmPlane, drmModeAtomicReqPtr pset, const PlaneRect &crtc, const PlaneRect &src);
     int32_t RemoveUnusePlane(drmModeAtomicReqPtr pset);
     int32_t FindPlaneAndApply(drmModeAtomicReqPtr pset);
+    bool CanScanout(HdiLayer &layer, const DrmPlane &plane) const;
+    bool IsFullScreen(HdiLayer &layer) const;
+    bool TestAssignment(const std::vector<PlaneAssignment> &assignment);
+    std::vector<PlaneAssignment> mAssignment;   // раскладка текущего кадра
+    std::vector<HdiLayer *> mFrameLayers;       // все слои кадра (для release fence)
     std::shared_ptr<DrmDevice> mDrmDevice;
     std::shared_ptr<DrmConnector> mConnector;
     std::shared_ptr<DrmCrtc> mCrtc;
